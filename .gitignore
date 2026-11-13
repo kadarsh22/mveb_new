@@ -1,0 +1,12 @@
+__pycache__
+.pydeps/
+.wandb_key
+exp/
+slurm_outputs/
+configs/mveb_debug.py
+configs/mveb_debug4n.py
+configs/mveb_1gpu.py
+configs/mveb_1gpu_dbg.py
+.DS_Store
+# cluster-specific job scripts (account name, scratch paths): kept local
+slurm_*.sh

@@ -55,6 +55,42 @@ class DataAugmentationDINO(object):
 
 
 
+class DataAugmentationVICReg(object):
+    """Two-view augmentation from VICReg
+    (https://github.com/facebookresearch/vicreg/blob/main/augmentations.py)."""
+    def __init__(self):
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.transform = transforms.Compose([
+            transforms.RandomResizedCrop(224, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply(
+                [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+                p=0.8,
+            ),
+            transforms.RandomGrayscale(p=0.2),
+            GaussianBlur(p=1.0),
+            Solarization(p=0.0),
+            transforms.ToTensor(),
+            normalize,
+        ])
+        self.transform_prime = transforms.Compose([
+            transforms.RandomResizedCrop(224, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply(
+                [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+                p=0.8,
+            ),
+            transforms.RandomGrayscale(p=0.2),
+            GaussianBlur(p=0.1),
+            Solarization(p=0.2),
+            transforms.ToTensor(),
+            normalize,
+        ])
+
+    def __call__(self, image):
+        return [self.transform(image), self.transform_prime(image)]
+
+
 class Solarization(object):
     """
     Apply Solarization to the PIL image.
@@ -94,7 +130,7 @@ class GaussianBlur(object):
 def build_dataloader(cfg):
     debug = getattr(cfg, 'debug', False)
 
-    train_transform = DataAugmentationDINO( (0.4, 1.), (0.05, 0.4), 6)
+    train_transform = DataAugmentationVICReg()
 
     test_transform = transforms.Compose([
         transforms.Resize(256),
@@ -121,7 +157,10 @@ def build_dataloader(cfg):
             num_workers=cfg.n_workers,
             sampler=train_sampler,
             drop_last=True,
-            persistent_workers=True
+            persistent_workers=True,
+            # 1, as ebreg main_vicreg.py (its OOM workaround); the default 2 would
+            # let MVEB hide more loader stalls and skew the time comparison
+            prefetch_factor=1,
         )
     memory_loader = torch.utils.data.DataLoader(
             dataset=memory_data,

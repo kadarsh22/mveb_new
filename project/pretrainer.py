@@ -13,20 +13,21 @@ from .model import build_model
 from .utils import AverageMeter
 from .utils import concat_all_gather
 from torch import nn, optim
+import torch.nn.functional as F
 
-def skip_nan_grad_backward(model, batch_idx):
-    valid_gradients = True
-    
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            valid_gradients = not (torch.isnan(param.grad).any() or torch.isinf(param.grad).any())
-            if not valid_gradients:
-                break
 
-    if not valid_gradients:
-        print(f"Deleted inf or nan values in gradients at batch_index {batch_idx}. Not updating model parameters.")
-        model.zero_grad()
+@torch.no_grad()
+def effective_rank(features):
+    """Return exp(entropy) of a matrix's normalized singular values.
 
+    Copied verbatim from ebreg metrics.effective_rank (commit b3720b35, the code of
+    run ciyr9vkb) so the online number is the same quantity: RankMe (Garrido et
+    al. 2023), uncentered, bounded by min(N, D).
+    """
+    singular_values = torch.linalg.svdvals(features.float())
+    singular_values = singular_values / singular_values.sum().clamp_min(1e-12)
+    entropy = -(singular_values * singular_values.clamp_min(1e-12).log()).sum()
+    return entropy.exp()
 
 class LARS(optim.Optimizer):
     def __init__(self, params, lr, weight_decay=0, momentum=0.9, eta=0.001,
@@ -89,10 +90,31 @@ class Pretrainer:
 
         # build optimizer
         self.optimizer = self.build_optimizer()
-        self.scaler = torch.cuda.amp.GradScaler()
+        # bf16 autocast (matches ebreg): same exponent range as fp32, so no loss
+        # scaling needed. Disabled scaler passes scale/unscale_/step through.
+        self.scaler = torch.amp.GradScaler('cuda', enabled=False)
 
         # build loss
         self.loss = getattr(self, self.cfg.loss)
+
+        # online linear probe, same as ebreg main_vicreg.py: LayerNorm (no affine)
+        # + Linear on detached first-view backbone features, its own SGD
+        # (momentum 0.9, constant lr, no weight decay), DDP-wrapped. It never
+        # sends gradients into the encoder.
+        self.probe = self.probe_core = self.probe_optimizer = None
+        if getattr(self.cfg, 'probe_lr', 0) > 0:
+            feat_dim = self.model.module.projector[0][0].in_features
+            n_classes = len(self.train_loader.dataset.classes)
+            if getattr(self.cfg, 'probe_layernorm', False):
+                self.probe_core = nn.Sequential(
+                    nn.LayerNorm(feat_dim, elementwise_affine=False),
+                    nn.Linear(feat_dim, n_classes)).cuda()
+            else:
+                self.probe_core = nn.Linear(feat_dim, n_classes).cuda()
+            self.probe = torch.nn.parallel.DistributedDataParallel(
+                self.probe_core, device_ids=[torch.cuda.current_device()])
+            self.probe_optimizer = optim.SGD(self.probe.parameters(),
+                                             lr=self.cfg.probe_lr, momentum=0.9)
 
     def build_optimizer(self):
         self.init_lr = self.cfg.base_lr * self.cfg.whole_batch_size / 256
@@ -142,6 +164,9 @@ class Pretrainer:
         self.model.load_state_dict(ckpt['model'], strict=False)
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scaler.load_state_dict(ckpt['scaler'])
+        if self.probe is not None and 'probe' in ckpt:
+            self.probe_core.load_state_dict(ckpt['probe'])
+            self.probe_optimizer.load_state_dict(ckpt['probe_optimizer'])
 
         self.start_epoch = ckpt['epoch'] + 1
         self.step = ckpt['step']
@@ -154,9 +179,13 @@ class Pretrainer:
         self.last_saved_ckpt = None
         self.start_epoch, self.step = 0, 0
         self.F = None # EMA for correlation matrix
+        probe_last_acc = probe_val_acc = None
+        eff_rank_emb = None  # last logged online effective rank (rank 0 only)
+        # correct, seen, loss_sum over the current log window (as ebreg)
+        probe_stats = torch.zeros(3, device='cuda')
 
         # resume if required
-        if self.cfg.resume_path is not None:
+        if getattr(self.cfg, "resume_path", None) is not None:
             self.resume(self.cfg.resume_path)
 
             # knn eval if required
@@ -170,6 +199,11 @@ class Pretrainer:
         # begin training
         self.logger.info(f'Begin training, start_epoch:{self.start_epoch}, step:{self.step}')
         for epoch in range(self.start_epoch, self.cfg.epochs):
+            # Epoch timer copies ebreg main_vicreg.py exactly so the two numbers
+            # cover the same span: perf_counter started before set_epoch, no CUDA
+            # sync, stopped on rank 0 after the probe val pass (so val epochs, every
+            # probe_val_every, include it in both) and before checkpoint saving.
+            epoch_start = time.perf_counter()
             if torch.distributed.is_available():
                 self.train_loader.sampler.set_epoch(epoch)
 
@@ -177,7 +211,8 @@ class Pretrainer:
             batch_time = AverageMeter('Time', ':6.3f')
             data_time = AverageMeter('Data', ':6.3f')
             losses = AverageMeter('Loss', ':.4f')
-            pos_sims = AverageMeter('Pos Sim', ':.4f')
+            # pos_sim summed on the GPU and read only on log steps (no per-step sync)
+            pos_sim_sum = torch.zeros((), device='cuda')
            
             # switch to train mode
             self.model.train()
@@ -190,43 +225,64 @@ class Pretrainer:
                 mm = self.adjust_mm(self.cfg.base_momentum, self.step)
                 self.step += 1
 
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     images = data[0]
-                    images = [im.cuda(non_blocking=True) for im in images]
+                    mf = torch.channels_last if getattr(self.cfg, 'channels_last', False) else torch.contiguous_format
+                    images = [im.cuda(non_blocking=True, memory_format=mf) for im in images]
                   
                     data_time.update(time.time() - end)
                     # forward
-                    z_f, z1m, z2m = self.model(images, mm=mm)
+                    z_f, z1m, z2m, feats = self.model(images, mm=mm)
                  
                     # print(time.time() - end)
          
                     # compute loss
-                    loss_aliment,loss_unifo = self.loss(z_f, z1m, z2m)
+                    # loss in fp32: the entropy estimator inverts an exp-kernel Gram
+                    # matrix, which bf16's ~8-bit mantissa would make unreliable
+                    with torch.amp.autocast('cuda', enabled=False):
+                        loss_aliment,loss_unifo = self.loss([z.float() for z in z_f], z1m.float(), z2m.float())
 
                     pos_sim=loss_aliment.detach()
                     loss= -loss_aliment-self.cfg.lambd*loss_unifo
-                    # exit if loss nan
-                    if torch.any(torch.isnan(loss)):
-                        print(f'{torch.cuda.current_device()} {loss}') 
-                    return_flag = torch.tensor([0]).cuda()
-                    if torch.isnan(loss):
-                        return_flag = torch.tensor([1]).cuda()
-                    torch.distributed.all_reduce(return_flag)
-                    if return_flag:
-                        self.logger.info(f"exit with loss value: {loss}")
-                        return -1
+                pos_sim_sum += pos_sim
 
-                losses.update(loss.item(), images[0].size(0))
-                pos_sims.update(pos_sim.item(), images[0].size(0))
-                
-                # compute gradient and do SGD step
                 self.optimizer.zero_grad()
-               
+
                 self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                skip_nan_grad_backward(self.model,i)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+
+                # online probe step on this batch's detached first-view features
+                if self.probe is not None:
+                    labels = data[1].cuda(non_blocking=True)
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                        logits = self.probe(feats[0])
+                        probe_loss = F.cross_entropy(logits, labels)
+                    self.probe_optimizer.zero_grad(set_to_none=True)
+                    probe_loss.backward()
+                    self.probe_optimizer.step()
+                    with torch.no_grad():
+                        probe_stats[0] += (logits.detach().argmax(dim=1) == labels).sum()
+                        probe_stats[1] += labels.numel()
+                        probe_stats[2] += probe_loss.detach().float() * labels.numel()
+
+                # online effective rank, as ebreg b3720b35 forward_stats: on log steps
+                # (itr % log_freq == 0), rank 0 only, no gather, RankMe of both views'
+                # backbone features cat(emb_x, emb_y) -> [2 * local batch, 2048]
+                if i % self.cfg.print_freq == 0 and torch.distributed.get_rank() == 0:
+                    eff_rank_emb = effective_rank(torch.cat([feats[0], feats[1]])).item()
+                    self.logger.info(f'Epoch: [{epoch}/{self.cfg.epochs}]  '
+                                     f'iter: {i+1}/{len(self.train_loader)}  '
+                                     f'train/effective_rank_emb: {eff_rank_emb:.2f}')
+
+                # one sync per step, after the steps are queued (as ebreg's loss.item())
+                loss_value = loss.item()
+                losses.update(loss_value, images[0].size(0))
+                if not math.isfinite(loss_value):
+                    # Rank-local on purpose (as ebreg): a collective here would hang the
+                    # run whenever only some ranks see the non-finite loss.
+                    print(f'[rank {torch.distributed.get_rank()}] non-finite loss at step '
+                          f'{self.step}: {loss_value!r}', flush=True)
 
                 # measure elapsed time
                 batch_time.update(time.time() - end)
@@ -237,9 +293,40 @@ class Pretrainer:
                                      f'{str(batch_time)}  ' \
                                      f'{str(data_time)}  ' \
                                      f'{str(losses)} ' \
-                                     f'{str(pos_sims)} ' \
+                                     f'Pos Sim {pos_sim.item():.4f} ({pos_sim_sum.item() / (i + 1):.4f}) ' \
                                      f'lr: {lr} ' \
                                      f'mm: {mm}')
+                # probe train acc over the whole global log window (SUM of counts,
+                # as ebreg); window = print_freq iterations
+                if self.probe is not None and (i + 1) % self.cfg.print_freq == 0:
+                    torch.distributed.all_reduce(probe_stats, op=torch.distributed.ReduceOp.SUM)
+                    correct, seen, loss_sum = probe_stats.tolist()
+                    if seen > 0:
+                        probe_last_acc = 100.0 * correct / seen
+                        self.logger.info(f'Epoch: [{epoch}/{self.cfg.epochs}]  '
+                                         f'iter: {i+1}/{len(self.train_loader)}  '
+                                         f'online_probe/train_acc: {probe_last_acc:.2f}  '
+                                         f'online_probe/loss: {loss_sum / seen:.4f}')
+                    probe_stats.zero_()
+
+            # probe val acc every probe_val_every epochs (all ranks: counts are
+            # all-reduced). Inside the epoch timer, as in ebreg.
+            probe_val_every = getattr(self.cfg, 'probe_val_every', 0)
+            if self.probe is not None and probe_val_every > 0 and (epoch + 1) % probe_val_every == 0:
+                probe_val_acc = self.evaluate_probe_val()
+
+            # rank-0 wall time, no sync (as ebreg's "[N] epoch time")
+            epoch_time = time.perf_counter() - epoch_start
+            n_iters = len(self.train_loader)
+            self.logger.info(f'[{epoch + 1}] epoch time: {epoch_time:.2f} s  '
+                             f'({epoch_time / 60:.2f} min, {epoch_time / n_iters:.3f} s/iter, '
+                             f'{n_iters * self.cfg.whole_batch_size / epoch_time:.1f} img/s)')
+            if self.probe is not None:
+                self.logger.info(f'[metric] epoch: {epoch + 1}  epoch_time_s: {epoch_time:.2f}  '
+                                 f'loss_avg: {losses.avg:.4f}  '
+                                 f'online_probe/train_acc: {probe_last_acc}  '
+                                 f'online_probe/val_acc: {probe_val_acc}  '
+                                 f'train/effective_rank_emb: {eff_rank_emb}')
 
             # save model
             if torch.distributed.get_rank() == 0:
@@ -253,7 +340,39 @@ class Pretrainer:
                            'scaler': self.scaler.state_dict(),
                            'step': self.step,
                            'epoch': epoch,
-                           'F': self.F,}, ckpt_name)
+                           'F': self.F,
+                           'probe': self.probe_core.state_dict() if self.probe is not None else None,
+                           'probe_optimizer': self.probe_optimizer.state_dict() if self.probe is not None else None,
+                           }, ckpt_name)
+
+    def evaluate_probe_val(self):
+        """Top-1 of the online probe on the ImageNet val split, all ranks.
+
+        Same as ebreg evaluate_probe_val: backbone features under bf16 autocast,
+        Resize(256)/CenterCrop(224), no augmentation; correct/total all-reduced.
+        Modules go back to train mode afterwards.
+        """
+        backbone = self.model.module.encoder
+        backbone.eval()
+        self.probe.eval()
+        mf = torch.channels_last if getattr(self.cfg, 'channels_last', False) else torch.contiguous_format
+        correct = torch.zeros((), device='cuda')
+        total = torch.zeros((), device='cuda')
+        with torch.no_grad():
+            for images, labels in self.test_loader:
+                images = images.cuda(non_blocking=True, memory_format=mf)
+                labels = labels.cuda(non_blocking=True)
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    logits = self.probe(backbone(images))
+                correct += (logits.argmax(dim=1) == labels).sum()
+                total += labels.numel()
+        torch.distributed.all_reduce(correct)
+        torch.distributed.all_reduce(total)
+        backbone.train()
+        self.probe.train()
+        acc = 100.0 * correct.item() / max(total.item(), 1.0)
+        self.logger.info(f'online probe val_acc {acc:.2f}%')
+        return acc
     
     def knn_eval(self, model):
         net = model.module.encoder

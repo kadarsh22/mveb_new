@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 CFG_PATH=$1
-GPUS=$32
+GPUS=$2
 PORT=${PORT:-28500}
 
 set -x
